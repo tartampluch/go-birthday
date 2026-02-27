@@ -1,0 +1,332 @@
+name: Production Release Build
+
+# ==============================================================================
+# TRIGGER CONFIGURATION
+# ==============================================================================
+# Automatically triggers the workflow when a semantic version tag (e.g., v1.0.0) is pushed.
+# The 'workflow_dispatch' event allows the workflow to be triggered manually from 
+# the GitHub Actions UI, which is highly useful for testing pipeline modifications.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# ==============================================================================
+# GLOBAL PERMISSIONS
+# ==============================================================================
+# Explicitly grant write access to the repository contents.
+# This permission is mandatory for the 'softprops/action-gh-release' step to 
+# create the official GitHub Release and upload the generated asset files.
+permissions:
+  contents: write
+
+jobs:
+  # ============================================================================
+  # BUILD AND PACKAGE JOB
+  # ============================================================================
+  # This job runs a matrix strategy to compile, post-process, and package the 
+  # application for all supported operating systems and CPU architectures.
+  release:
+    name: Build & Package (${{ matrix.os }} - ${{ matrix.goarch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Run one matrix job at a time to prevent rate-limiting or resource contention
+      # (especially useful when downloading large external toolchains like Zig or AppImageTool).
+      max-parallel: 1
+      # Allow other matrix jobs to complete even if one fails. This ensures we still 
+      # get partial releases (e.g., Windows succeeds even if Linux fails).
+      fail-fast: false 
+      
+      # The Matrix defines the build matrix. 
+      # 'output_name' is the temporary raw binary name.
+      # 'archive_name' is the standardized, web-safe distribution zip file.
+      matrix:
+        include:
+          # --- Linux Builds ---
+          # Requires CGO enabled to interface with X11/OpenGL graphics libraries (Fyne).
+          - os: ubuntu-latest
+            goarch: amd64
+            output_name: go-birthday
+            archive_name: go-birthday-linux-amd64.zip
+            extra_flags: "-s -w"
+            cgo: '1'
+          - os: ubuntu-24.04-arm
+            goarch: arm64
+            output_name: go-birthday
+            archive_name: go-birthday-linux-arm64.zip
+            extra_flags: "-s -w"
+            cgo: '1'
+
+          # --- Windows Builds ---
+          # The '-H=windowsgui' flag is crucial: it ensures the Go binary launches 
+          # as a standard Windows GUI application without spawning an ugly background command prompt.
+          - os: windows-latest
+            goarch: amd64
+            output_name: go-birthday.exe
+            archive_name: go-birthday-windows-amd64.zip
+            extra_flags: "-H=windowsgui -s -w"
+            cgo: '1'
+          - os: windows-latest
+            goarch: arm64
+            output_name: go-birthday.exe
+            archive_name: go-birthday-windows-arm64.zip
+            extra_flags: "-H=windowsgui -s -w"
+            cgo: '1'
+
+          # --- macOS Builds ---
+          # Native compilation for older Intel Macs and modern Apple Silicon Macs.
+          # Requires CGO to interface with Apple's native Cocoa and OpenGL frameworks.
+          - os: macos-15-intel
+            goarch: amd64
+            output_name: go-birthday
+            archive_name: go-birthday-darwin-amd64.zip
+            extra_flags: "-s -w"
+            cgo: '1'
+          - os: macos-latest
+            goarch: arm64
+            output_name: go-birthday
+            archive_name: go-birthday-darwin-arm64.zip
+            extra_flags: "-s -w"
+            cgo: '1'
+
+    steps:
+      # ------------------------------------------------------------------------
+      # 1. Workspace Setup
+      # ------------------------------------------------------------------------
+      - name: Checkout Source Code
+        uses: actions/checkout@v6
+        with:
+          # fetch-depth: 0 is required so the Git history includes all tags.
+          # Without this, 'git describe' or version extraction logic might fail.
+          fetch-depth: 0 
+
+      - name: Setup Go Environment
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25' # Synchronized with go.mod for maximum stability
+
+      # ------------------------------------------------------------------------
+      # 2. System Dependencies Installation
+      # ------------------------------------------------------------------------
+      # Fyne UI Toolkit requires native C libraries on Linux for window creation and OpenGL rendering.
+      - name: Install Linux Dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1-mesa-dev xorg-dev
+
+      # When running on a Windows AMD64 GitHub runner but targeting Windows ARM64, 
+      # standard MinGW cannot cross-compile CGO. We install Zig via Chocolatey to act 
+      # as a drop-in, robust C/C++ cross-compiler.
+      - name: Install Zig Cross-Compiler (Windows ARM64 Support)
+        if: runner.os == 'Windows' && matrix.goarch == 'arm64'
+        run: choco install zig -y
+
+      - name: Verify Go Modules
+        run: go mod verify
+
+      # ------------------------------------------------------------------------
+      # 3. Windows Resource Generation (Icon & Metadata)
+      # ------------------------------------------------------------------------
+      # Windows requires icons and metadata (Version, Copyright) to be compiled 
+      # into the executable. We use 'go-winres' to generate .syso files based on winres.json.
+      # The Go compiler automatically detects .syso files in the package directory and links them.
+      - name: Generate Windows Resources (.syso)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # Safely extract semantic version, defaulting to 0.0.0 for non-tag test runs
+          VERSION=${GITHUB_REF#refs/tags/v}
+          if [[ "$VERSION" == *"refs/"* ]]; then VERSION="0.0.0"; fi
+          
+          echo "=> Installing go-winres toolkit..."
+          go install github.com/tc-hib/go-winres@latest
+          
+          echo "=> Compiling embedded resources for both architectures..."
+          go-winres make --product-version ${VERSION} --file-version ${VERSION} --arch amd64,arm64
+          
+          echo "=> Migrating generated .syso payloads to the main application directory..."
+          mv rsrc_windows_*.syso cmd/go-birthday/
+
+      # ------------------------------------------------------------------------
+      # 4. Quality Assurance
+      # ------------------------------------------------------------------------
+      # Limit testing to AMD64 to prevent execution failures. Cross-compiled ARM64 
+      # binaries cannot run natively on AMD64 runners without emulation tools like QEMU.
+      - name: Execute Test Suite
+        if: matrix.goarch == 'amd64'
+        run: go test -v -race ./...
+
+      # ------------------------------------------------------------------------
+      # 5. Core Compilation
+      # ------------------------------------------------------------------------
+      - name: Compile Go Binary
+        shell: bash
+        env:
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: ${{ matrix.cgo }}
+        run: |
+          echo "=> Resolving build metadata..."
+          VERSION=${GITHUB_REF#refs/tags/v}
+          if [[ "$VERSION" == *"refs/"* ]]; then VERSION="dev-build"; fi
+          COMMIT=$(git rev-parse --short HEAD)
+          DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          PKG="github.com/tartampluch/go-birthday/internal/config"
+
+          echo "=> Configuring cross-compilation environment (if applicable)..."
+          # Override default C/C++ compilers with Zig when targeting Windows ARM64.
+          if [[ "${{ runner.os }}" == "Windows" && "${{ matrix.goarch }}" == "arm64" ]]; then
+            export CC="zig cc -target aarch64-windows-gnu"
+            export CXX="zig c++ -target aarch64-windows-gnu"
+          fi
+          
+          echo "=> Constructing dynamic linker flags..."
+          # Inject build metadata into the config package variables at link time using '-X'.
+          LDFLAGS="${{ matrix.extra_flags }} -X '${PKG}.Version=${VERSION}' -X '${PKG}.Commit=${COMMIT}' -X '${PKG}.Date=${DATE}'"
+          
+          echo "=> Executing Go compiler for ${{ matrix.os }}/${{ matrix.goarch }}..."
+          go build -v -ldflags "$LDFLAGS" -o ${{ matrix.output_name }} ./cmd/go-birthday
+
+      # ------------------------------------------------------------------------
+      # 6. Platform-Specific Post-Processing & Standardized Packaging
+      # ------------------------------------------------------------------------
+      # STRATEGY: "Standardized Archive Distribution". 
+      # We create user-friendly, clean filenames internally (e.g., "Go Birthday.exe") 
+      # and wrap them in structurally predictable, web-safe archive names (e.g., "go-birthday-windows-amd64.zip").
+      # This prevents naming collisions in the GitHub Release while providing a flawless UX upon extraction.
+      
+      # --- Windows: Rename and Zip ---
+      - name: Package Windows Binary
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "=> Renaming binary to the finalized, user-friendly name..."
+          mv ${{ matrix.output_name }} "Go Birthday.exe"
+          
+          echo "=> Wrapping in release archive: ${{ matrix.archive_name }}..."
+          # The standard 'zip' command is missing in Windows Git Bash.
+          # We leverage 7-Zip ('7z'), which is pre-installed on GitHub Windows runners.
+          # The '-tzip' flag forces the standard .zip format. '-bso0' makes it quiet (like zip -q).
+          7z a -tzip -bso0 ${{ matrix.archive_name }} "Go Birthday.exe"
+
+      # --- macOS: Create Bundle and Zip ---
+      - name: Package macOS Application Bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          echo "=> Resolving bundle version..."
+          VERSION=${GITHUB_REF#refs/tags/v}
+          if [[ "$VERSION" == *"refs/"* ]]; then VERSION="1.0.0"; fi
+          
+          echo "=> Installing official Fyne CLI..."
+          go install fyne.io/fyne/v2/cmd/fyne@latest
+          
+          echo "=> Scaffolding native macOS .app bundle..."
+          fyne package -os darwin -executable ${{ matrix.output_name }} -icon internal/ui/Icon.png -name "Go Birthday" -appID com.github.tartampluch.go-birthday -appVersion ${VERSION}
+          
+          echo "=> Configuring as a background agent (Hiding from Dock)..."
+          # 'plutil' is a native macOS tool used to modify .plist files safely.
+          # Setting LSUIElement to true tells macOS this is a menu-bar only app.
+          plutil -insert LSUIElement -bool true "Go Birthday.app/Contents/Info.plist"
+          
+          echo "=> Archiving bundle into web-safe format: ${{ matrix.archive_name }}..."
+          zip -qr ${{ matrix.archive_name }} "Go Birthday.app"
+
+      # --- Linux: Construct AppImage and Zip ---
+      - name: Package Linux AppImage
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          echo "=> Identifying target architecture for AppImageTool..."
+          if [ "${{ matrix.goarch }}" == "amd64" ]; then
+            APPIMAGE_ARCH="x86_64"
+          else
+            APPIMAGE_ARCH="aarch64"
+          fi
+          
+          echo "=> Fetching AppImageTool..."
+          wget -qO appimagetool "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-${APPIMAGE_ARCH}.AppImage"
+          chmod +x appimagetool
+          
+          echo "=> Initializing AppDir virtual filesystem structure..."
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
+          
+          echo "=> Injecting executable and icon assets..."
+          cp ${{ matrix.output_name }} AppDir/usr/bin/go-birthday
+          cp internal/ui/Icon.png AppDir/go-birthday.png
+          cp internal/ui/Icon.png AppDir/usr/share/icons/hicolor/256x256/apps/go-birthday.png
+          
+          echo "=> Generating freedesktop.org compliant .desktop manifest..."
+          cat <<EOF > AppDir/go-birthday.desktop
+          [Desktop Entry]
+          Name=Go Birthday
+          Exec=go-birthday
+          Icon=go-birthday
+          Type=Application
+          Categories=Utility;
+          EOF
+          
+          echo "=> Writing AppRun execution wrapper..."
+          cat <<'EOF' > AppDir/AppRun
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "${0}")")"
+          export PATH="${HERE}/usr/bin:$PATH"
+          exec "${HERE}/usr/bin/go-birthday" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+          
+          echo "=> Compiling the finalized AppImage..."
+          # --appimage-extract-and-run circumvents the lack of FUSE daemon on GitHub Actions runners.
+          ARCH=$APPIMAGE_ARCH ./appimagetool --appimage-extract-and-run AppDir Go-Birthday.AppImage
+          
+          echo "=> Archiving into web-safe format: ${{ matrix.archive_name }}..."
+          # Zipping the AppImage ensures it doesn't collide with the ARM64 variant in the GitHub Release assets list.
+          zip -q ${{ matrix.archive_name }} Go-Birthday.AppImage
+
+      # ------------------------------------------------------------------------
+      # 7. Artifact Consolidation
+      # ------------------------------------------------------------------------
+      - name: Prepare Final Release Artifacts
+        shell: bash
+        run: |
+          echo "=> Staging localized platform assets into a unified release directory..."
+          mkdir -p release-artifacts
+          
+          # Only the final, cleanly named Zip archive is exported to the next stage.
+          mv ${{ matrix.archive_name }} release-artifacts/
+
+      - name: Upload Job Artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          # Name is unique per matrix to avoid overwriting during parallel uploads.
+          name: distribution-assets-${{ matrix.os }}-${{ matrix.goarch }}
+          path: release-artifacts/*
+          retention-days: 5 # Short retention since they will be pushed to the GitHub Release almost immediately.
+
+  # ============================================================================
+  # PUBLISH RELEASE JOB
+  # ============================================================================
+  # This job waits for all matrices to complete, downloads the compiled zip archives,
+  # and publishes an official GitHub Release attached to the pushed Git tag.
+  publish:
+    name: Publish GitHub Release
+    needs: release
+    runs-on: ubuntu-latest
+    # Acts as a strict safety net: prevents automated releases for manual workflow runs on non-tag branches.
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download Consolidated Build Artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          # merge-multiple flattens all artifacts from the matrix sub-jobs into a single 'dist' root directory.
+          merge-multiple: true
+
+      - name: Instantiate GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false

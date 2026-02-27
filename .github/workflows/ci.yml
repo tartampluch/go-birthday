@@ -1,0 +1,77 @@
+name: CI Quality Check
+
+# Trigger on pushes to the main branch and any pull request.
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ----------------------------------------------------------------------------
+  # Job 1: Linting
+  # Checks code style and suspicious constructs using golangci-lint.
+  # ----------------------------------------------------------------------------
+  lint:
+    name: Lint Code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          
+      # Fyne dependencies are needed even for linting if type checking is involved.
+      - name: Install Linux Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1-mesa-dev xorg-dev
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.6
+
+  # ----------------------------------------------------------------------------
+  # Job 2: Testing & Building
+  # Runs unit tests and ensures the binary compiles on all major platforms.
+  # ----------------------------------------------------------------------------
+  test:
+    name: Test & Build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      max-parallel: 1
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Set up Go
+      uses: actions/setup-go@v6
+      with:
+        go-version: '1.25'
+
+    # --- Linux Dependencies ---
+    # Required for Fyne to compile/test on Linux runners.
+    - name: Install Linux Dependencies
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libgl1-mesa-dev xorg-dev
+
+    # --- Tests ---
+    # Run tests with race detection to catch concurrency bugs.
+    - name: Run Unit Tests
+      run: go test -v -race ./...
+
+    # --- Dry-Run Build ---
+    # Ensures the application compiles correctly, even if we don't keep the artifact.
+    # This catches compilation errors that might be skipped by tests.
+    - name: Verify Build
+      run: go build -v ./cmd/go-birthday

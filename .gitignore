@@ -1,0 +1,9 @@
+.vscode/
+.idea/
+.DS_Store
+debug.log
+/go-birthday
+/go-birthday.exe
+*.log
+*.syso
+*.tmp
